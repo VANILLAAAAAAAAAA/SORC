@@ -507,16 +507,11 @@ local AutoReplayBox = Tabs.Main:AddRightGroupbox('Auto Replay')
 
 local StatusLabel = StatusBox:AddLabel('Idle')
 
-
-
-
-
 local function setStatus(msg)
     pcall(function() StatusLabel:SetText(tostring(msg)) end)
     print("[AutoFarm] " .. tostring(msg))
 end
 
--- Multi-line replay status. Only touches the label, not the console.
 local function setReplayStatus(completed, total, secsLeft, nextDesc)
     local text = string.format(
         "Playing (%s)...\n(%d/%d actions)\n%.1fs until next action\n--> %s",
@@ -527,7 +522,6 @@ local function setReplayStatus(completed, total, secsLeft, nextDesc)
     pcall(function() StatusLabel:SetText(text) end)
 end
 
--- Human-readable description for an action's status line.
 local function describeAction(action, prevAction)
     if not action then return "?" end
     local name = tostring(action.name or "?")
@@ -595,11 +589,24 @@ local function recordNamecall(self, ...)
 
     local result = table.pack(originalNamecall(self, ...))
 
-    local moneyAfter = getMoney()
     local selfName   = self.Name
 
     task.defer(function()
         pcall(function()
+            -- Only SpawnNewTower / UpgradeTower cost money.
+            local moneyAfter = moneyBefore
+            if selfName == "SpawnNewTower" or selfName == "UpgradeTower" then
+                local t0 = os.clock()
+                while os.clock() - t0 < 0.5 do
+                    local m = getMoney()
+                    if m and m ~= moneyBefore then
+                        moneyAfter = m
+                        break
+                    end
+                    task.wait(0.02)
+                end
+            end
+
             if selfName == "SpawnNewTower" and methodNow == "InvokeServer" then
                 if typeof(result[1]) == "Instance" then
                     table.insert(RecordedSpawnedTowers, result[1])
@@ -693,32 +700,6 @@ local function waitForMoneyDeduct(baseline, cost, timeout)
     return false
 end
 
-local function waitForMoneyIndefinitely(required, actionIdx, actionDesc, total)
-    if not required or required <= 0 then return true end
-    local reported = false
-    while IsReplaying do
-        local m = getMoney()
-        if m and m >= required then
-            if reported then
-                setReplayStatus(actionIdx - 1, total, 0, actionDesc)
-            end
-            return true
-        end
-        if not reported then
-            pcall(function()
-                StatusLabel:SetText(string.format(
-                    "Waiting for money (#%d %s)\n%s / %s",
-                    actionIdx, tostring(actionDesc),
-                    tostring(m or "?"), tostring(math.floor(required))
-                ))
-            end)
-            reported = true
-        end
-        task.wait(0.15)
-    end
-    return false
-end
-
 --=============================================================
 --  REPLAY
 --=============================================================
@@ -756,7 +737,6 @@ local function replayOnce()
         local gapTarget      = lastFireTime + MIN_ACTION_GAP
         local targetTime     = math.max(absoluteTarget, gapTarget)
 
-        -- Live countdown to this action's fire time
         local totalWait = targetTime - os.clock()
         if totalWait > 0 then
             local waitEnd = os.clock() + totalWait
@@ -777,15 +757,14 @@ local function replayOnce()
             table.insert(failed, { idx = idx, name = actionName, reason = "remote missing" })
             lastFireTime = os.clock()
         else
+            -- Only SpawnNewTower / UpgradeTower actually spend money.
+            -- Everything else is cost=0 so old recordings with bleed-in
+            -- cost on RequestTower / Click still work.
             local cost = 0
-            if action.money_before and action.money_after then
-                cost = action.money_before - action.money_after
-                if cost < 0 then cost = 0 end
-            end
-
-            if cost > 0 then
-                if not waitForMoneyIndefinitely(cost, idx, description, total) then
-                    break
+            if actionName == "SpawnNewTower" or actionName == "UpgradeTower" then
+                if action.money_before and action.money_after then
+                    cost = action.money_before - action.money_after
+                    if cost < 0 then cost = 0 end
                 end
             end
 
@@ -795,15 +774,6 @@ local function replayOnce()
 
             while attempt < MAX_RETRIES and IsReplaying do
                 attempt = attempt + 1
-
-                if cost > 0 then
-                    local m = getMoney()
-                    if not m or m < cost then
-                        if not waitForMoneyIndefinitely(cost, idx, description, total) then
-                            break
-                        end
-                    end
-                end
 
                 local packed = table.pack(unpackArgs(action.args))
                 local unresolved = false
@@ -863,7 +833,7 @@ local function replayOnce()
 
                 print(("[AF] action #%d (%s) failed attempt %d/%d")
                     :format(idx, description, attempt, MAX_RETRIES))
-                task.wait(0.3)
+                task.wait(0.05)
             end
 
             if not success and not skipped then
@@ -1101,6 +1071,9 @@ local function saveRecording(name)
     end
     if type(writefile) ~= "function" then setStatus("writefile unavailable"); return end
 
+    -- Sort by time before saving so the file is chronological.
+    table.sort(Recording, function(a, b) return a.t < b.t end)
+
     local out = {}
     for _, a in ipairs(Recording) do
         table.insert(out, {
@@ -1155,6 +1128,11 @@ function loadRecording(name)
             money_after  = a.money_after,
         })
     end
+
+    -- Sort by time so old recordings recorded out-of-order (deferred block
+    -- re-orders RequestTower / SpawnNewTower inserts) still replay correctly.
+    table.sort(Recording, function(a, b) return a.t < b.t end)
+
     setStatus(("Loaded %d actions from %s.json"):format(#Recording, name))
 end
 
