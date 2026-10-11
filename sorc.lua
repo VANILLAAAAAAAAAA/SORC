@@ -43,6 +43,9 @@ local PendingPlaybackCancel = false
 
 local CurrentReplayName     = "?"
 
+local InfiniteWaitEnabled   = false
+local InstantClicksEnabled  = false
+
 local AutoReplayEnabled        = false
 local WATCHDOG_TIMER_PATH      = "workspace.Info.Time.Timer"
 local WATCHDOG_STALL_TIMEOUT   = 5
@@ -128,6 +131,18 @@ local function packArgs(...) return { n = select("#", ...), ... } end
 local function unpackArgs(t) return table.unpack(t, 1, t.n or #t) end
 
 local function resolveRemote(path)
+    if type(path) ~= "string" then return nil end
+
+    -- Rewrite "Players.<oldname>." to the current LocalPlayer.
+    -- Recordings made on another account still work.
+    local lp = Players.LocalPlayer
+    if lp then
+        local otherName = path:match("^Players%.([^%.]+)%.")
+        if otherName and otherName ~= lp.Name then
+            path = "Players." .. lp.Name .. "." .. path:sub(#"Players." + #otherName + 2)
+        end
+    end
+
     local ok, obj = pcall(function()
         local cur = game
         for part in string.gmatch(path, "[^%.]+") do
@@ -177,8 +192,12 @@ local function findTowerByNameAndPosition(name, cfComponents)
 
     local function add(obj)
         if obj and obj.Name == name and not seen[obj] then
-            seen[obj] = true
-            table.insert(candidates, obj)
+            -- Verify the instance is live (not destroyed)
+            local ok = pcall(function() return obj.Parent end)
+            if ok then
+                seen[obj] = true
+                table.insert(candidates, obj)
+            end
         end
     end
 
@@ -214,7 +233,7 @@ local function findTowerByNameAndPosition(name, cfComponents)
                     if d < bestDist then best, bestDist = obj, d end
                 end
             end
-            if best then return best end
+            if best and bestDist < 20 then return best end
         end
     end
 
@@ -278,16 +297,26 @@ local function decodeArg(a)
     end
 
     if a.__t == "TowerRef" then
-        if a.__spawn_index and ReplaySpawnedTowers[a.__spawn_index] then
-            return ReplaySpawnedTowers[a.__spawn_index]
+        -- Prefer fresh name+position lookup — the tower instance the game
+        -- uses may have been replaced/renamed mid-round, so a stale cached
+        -- spawn reference can throw "Config is not a valid member" on the server.
+        if a.name then
+            local inst = findTowerByNameAndPosition(a.name, a.cf)
+            if inst then return inst end
         end
+        -- Fall back to spawn index
+        if a.__spawn_index and ReplaySpawnedTowers[a.__spawn_index] then
+            local inst = ReplaySpawnedTowers[a.__spawn_index]
+            local ok = pcall(function() return inst.Parent end)
+            if ok and inst.Parent ~= nil then
+                return inst
+            end
+        end
+        -- Last resort: path
         if a.path then
             local inst = resolveRemote(a.path)
             if inst then return inst end
         end
-        local inst = findTowerByNameAndPosition(a.name, a.cf)
-        if inst then return inst end
-        warn("[AutoFarm] could not resolve tower '" .. tostring(a.name) .. "'")
         return nil
     end
 
@@ -504,8 +533,20 @@ local RightBox      = Tabs.Main:AddRightGroupbox('Playback')
 local DelayBox      = Tabs.Main:AddRightGroupbox('Playback Start Delay')
 local SkipBox       = Tabs.Main:AddRightGroupbox('Auto Skip')
 local AutoReplayBox = Tabs.Main:AddRightGroupbox('Auto Replay')
+local ExtrasBox     = Tabs.Main:AddRightGroupbox('Extras')
 
 local StatusLabel = StatusBox:AddLabel('Idle')
+
+-- Force the Status groupbox to be tall enough for 4-line text.
+-- The AddLeftGroupbox height arg isn't respected in this Linoria build.
+task.defer(function()
+    task.wait(0.3)
+    pcall(function()
+        if StatusBox.Main then
+            StatusBox.Main.Size = UDim2.new(1, 0, 0, 220)
+        end
+    end)
+end)
 
 local function setStatus(msg)
     pcall(function() StatusLabel:SetText(tostring(msg)) end)
@@ -593,7 +634,6 @@ local function recordNamecall(self, ...)
 
     task.defer(function()
         pcall(function()
-            -- Only SpawnNewTower / UpgradeTower cost money.
             local moneyAfter = moneyBefore
             if selfName == "SpawnNewTower" or selfName == "UpgradeTower" then
                 local t0 = os.clock()
@@ -708,7 +748,8 @@ local function replayOnce()
     IsReplaying = true
     ReplaySpawnedTowers = {}
     CurrentReplayName = SelectedRecording or "(in memory)"
-    setStatus(("Replaying %d actions (%s)"):format(#Recording, CurrentReplayName))
+    setReplayStatus(0, #Recording, 0, "(starting)")
+    print(("[AutoFarm] Replaying %d actions (%s)"):format(#Recording, CurrentReplayName))
 
     if not MoneyObj then
         setupMoney()
@@ -733,9 +774,18 @@ local function replayOnce()
         local prevAction  = Recording[idx - 1]
         local description = describeAction(action, prevAction)
 
-        local absoluteTarget = start + action.t
-        local gapTarget      = lastFireTime + MIN_ACTION_GAP
-        local targetTime     = math.max(absoluteTarget, gapTarget)
+        local targetTime
+        if InstantClicksEnabled then
+            if lastFireTime == -math.huge then
+                targetTime = os.clock()
+            else
+                targetTime = lastFireTime + 0.05
+            end
+        else
+            local absoluteTarget = start + action.t
+            local gapTarget      = lastFireTime + MIN_ACTION_GAP
+            targetTime           = math.max(absoluteTarget, gapTarget)
+        end
 
         local totalWait = targetTime - os.clock()
         if totalWait > 0 then
@@ -747,6 +797,9 @@ local function replayOnce()
                 setReplayStatus(idx - 1, total, remaining, description)
                 task.wait(0.1)
             end
+        else
+            -- Still show the status even when firing immediately
+            setReplayStatus(idx - 1, total, 0, description)
         end
 
         if not IsReplaying then break end
@@ -757,9 +810,6 @@ local function replayOnce()
             table.insert(failed, { idx = idx, name = actionName, reason = "remote missing" })
             lastFireTime = os.clock()
         else
-            -- Only SpawnNewTower / UpgradeTower actually spend money.
-            -- Everything else is cost=0 so old recordings with bleed-in
-            -- cost on RequestTower / Click still work.
             local cost = 0
             if actionName == "SpawnNewTower" or actionName == "UpgradeTower" then
                 if action.money_before and action.money_after then
@@ -771,8 +821,18 @@ local function replayOnce()
             local attempt = 0
             local success = false
             local skipped = false
+            local serverErrored = false
 
-            while attempt < MAX_RETRIES and IsReplaying do
+            while IsReplaying do
+                -- Cap: if InfiniteWait is off, respect MAX_RETRIES.
+                -- If InfiniteWait is on, only infinite-retry money-drops,
+                -- not server-side errors (which never succeed on retry).
+                if not InfiniteWaitEnabled and attempt >= MAX_RETRIES then
+                    break
+                end
+                if serverErrored and not InfiniteWaitEnabled then
+                    break
+                end
                 attempt = attempt + 1
 
                 local packed = table.pack(unpackArgs(action.args))
@@ -807,6 +867,7 @@ local function replayOnce()
                     end)
 
                     if not ok then
+                        serverErrored = true
                         warn("[AutoFarm] InvokeServer error on " .. actionPath .. ": "
                             .. tostring(invokeResult or "(nil)"))
                     else
@@ -831,17 +892,31 @@ local function replayOnce()
                     break
                 end
 
-                print(("[AF] action #%d (%s) failed attempt %d/%d")
-                    :format(idx, description, attempt, MAX_RETRIES))
+                -- Don't spam infinite-wait on server errors; they won't get better.
+                if serverErrored then
+                    break
+                end
+
+                if InfiniteWaitEnabled then
+                    print(("[AF] action #%d (%s) failed attempt %d (infinite wait)")
+                        :format(idx, description, attempt))
+                else
+                    print(("[AF] action #%d (%s) failed attempt %d/%d")
+                        :format(idx, description, attempt, MAX_RETRIES))
+                end
                 task.wait(0.05)
             end
 
-            if not success and not skipped then
+            if success then
+                -- ok
+            elseif skipped then
+                table.insert(failed, { idx = idx, name = description, reason = "unresolved tower" })
+            elseif serverErrored then
+                table.insert(failed, { idx = idx, name = description, reason = "server rejected" })
+            elseif IsReplaying then
                 warn(("[AF] action #%d (%s) FAILED after %d attempts")
                     :format(idx, description, MAX_RETRIES))
                 table.insert(failed, { idx = idx, name = description, reason = "remote rejected" })
-            elseif skipped then
-                table.insert(failed, { idx = idx, name = description, reason = "unresolved tower" })
             end
 
             lastFireTime = os.clock()
@@ -1071,7 +1146,6 @@ local function saveRecording(name)
     end
     if type(writefile) ~= "function" then setStatus("writefile unavailable"); return end
 
-    -- Sort by time before saving so the file is chronological.
     table.sort(Recording, function(a, b) return a.t < b.t end)
 
     local out = {}
@@ -1129,8 +1203,6 @@ function loadRecording(name)
         })
     end
 
-    -- Sort by time so old recordings recorded out-of-order (deferred block
-    -- re-orders RequestTower / SpawnNewTower inserts) still replay correctly.
     table.sort(Recording, function(a, b) return a.t < b.t end)
 
     setStatus(("Loaded %d actions from %s.json"):format(#Recording, name))
@@ -1325,6 +1397,29 @@ AutoReplayBox:AddToggle('AutoReplayToggle', {
         else
             setStatus("Auto Replay: disabled")
         end
+    end,
+})
+
+--=============================================================
+--  EXTRAS UI
+--=============================================================
+ExtrasBox:AddToggle('InfiniteWaitToggle', {
+    Text = 'Infinite Wait',
+    Default = false,
+    Tooltip = 'On a failed upgrade or placement, keep retrying until it succeeds — no 100-attempt cap. Server-side errors still give up.',
+    Callback = function(state)
+        InfiniteWaitEnabled = state
+        setStatus(state and "Infinite Wait: enabled" or "Infinite Wait: disabled")
+    end,
+})
+
+ExtrasBox:AddToggle('InstantClicksToggle', {
+    Text = 'Instant Clicks',
+    Default = false,
+    Tooltip = 'Ignore the recorded timing between actions and fire every action 50ms apart.',
+    Callback = function(state)
+        InstantClicksEnabled = state
+        setStatus(state and "Instant Clicks: enabled" or "Instant Clicks: disabled")
     end,
 })
 
